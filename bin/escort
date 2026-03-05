@@ -182,22 +182,90 @@ end
 module RequestModifier
   module_function
 
+  # Extract a meaningful query from the conversation for crib retrieval.
+  #
+  # Two cases:
+  #
+  # 1. Human just typed something — the last user message contains plain text
+  #    blocks (not wrapped in XML). Use the human's text.
+  #
+  # 2. Agentic step — the last user message is tool results and system-reminder
+  #    XML only. Use the last assistant message's reasoning text instead. This
+  #    reflects what the agent is currently working on, so memories relevant to
+  #    the agent's current focus are surfaced.
+  #
+  # Text blocks entirely wrapped in a single XML element (<system-reminder>,
+  # <command-name>, etc.) are filtered as system injections.
   def extract_query(body)
     messages = body['messages']
     return nil unless messages.is_a?(Array) && !messages.empty?
 
-    last_user = messages.reverse.find { |m| m['role'] == 'user' }
-    return nil unless last_user
+    # Try the last user message for human-authored text.
+    last_user = messages.reverse_each.find { |m| m['role'] == 'user' }
+    if last_user
+      human_text = extract_plain_text(last_user['content'])
+      return human_text[-500..] unless human_text.empty?
+    end
 
-    content = last_user['content']
-    text = case content
-           when String then content
-           when Array
-             content.filter_map { |c| c['text'] if c.is_a?(Hash) && c['type'] == 'text' }.join(' ')
-           end
-    return nil if text.nil? || text.strip.empty?
+    # Agentic step: use the agent's reasoning from the last assistant message.
+    last_assistant = messages.reverse_each.find { |m| m['role'] == 'assistant' }
+    if last_assistant
+      reasoning = extract_assistant_text(last_assistant['content'])
+      return reasoning[-500..] unless reasoning.empty?
+    end
 
-    text[-500..]
+    nil
+  end
+
+  # Extract text blocks from user message content, filtering out blocks
+  # that are entirely wrapped in a single XML element (system injections).
+  def extract_plain_text(content)
+    texts = case content
+            when String
+              s = content.strip
+              system_injected?(s) ? [] : [s]
+            when Array
+              content.filter_map { |block|
+                next unless block.is_a?(Hash) && block['type'] == 'text'
+                t = block['text'].to_s.strip
+                next if t.empty? || system_injected?(t)
+                t
+              }
+            else
+              []
+            end
+    texts.join("\n").strip
+  end
+
+  # Extract text blocks from assistant message content. These are the agent's
+  # reasoning — tool_use blocks are skipped, no XML filtering needed.
+  def extract_assistant_text(content)
+    texts = case content
+            when String then [content.strip]
+            when Array
+              content.filter_map { |block|
+                next unless block.is_a?(Hash) && block['type'] == 'text'
+                t = block['text'].to_s.strip
+                next if t.empty?
+                t
+              }
+            else
+              []
+            end
+    texts.join("\n").strip
+  end
+
+  # Returns true if the text appears to be system-injected content.
+  # Two checks:
+  #   1. Entirely wrapped in a single XML element (<system-reminder>...</system-reminder>)
+  #   2. Contains any paired XML tags — system injections embed <example>, <summary>,
+  #      <condition>, etc. Human-typed text almost never contains paired XML tags.
+  def system_injected?(text)
+    # Entirely a single XML element
+    return true if text.match?(/\A<([a-zA-Z][\w-]*)\b[^>]*>.*<\/\1>\s*\z/m)
+    # Contains any paired XML tags
+    return true if text.match?(/<([a-zA-Z][\w-]*)\b[^>]*>.*<\/\1>/m)
+    false
   end
 
   def inject_memory(body, memory_text)
@@ -420,9 +488,12 @@ class EscortProxy
     # Shortcut: no query or no session → passthrough
     unless query && session_id
       log_request(messages: messages.size, model: body['model'], query: nil, action: 'passthrough')
+      $stderr.puts "escort: query_text: (none)" unless query
       StreamForwarder.forward(client, method, path, headers, body_raw)
       return
     end
+
+    $stderr.puts "escort: query_text: #{query}"
 
     started_at = Time.now
     result = @retriever.retrieve(query)
@@ -434,6 +505,7 @@ class EscortProxy
       modified_raw = JSON.generate(body)
       log_request(messages: messages.size, model: body['model'], query: query.length,
                   crib_ms: crib_ms, injected: result[:text].bytesize, action: 'injected')
+      $stderr.puts result[:text]
       StreamForwarder.forward(client, method, path, headers, modified_raw)
     elsif result
       log_request(messages: messages.size, model: body['model'], query: query.length,
