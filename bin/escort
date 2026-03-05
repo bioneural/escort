@@ -20,7 +20,7 @@
 #   ESCORT_CRIB           Crib binary path (default: sibling ../../crib/bin/crib)
 #   ESCORT_TOKEN_BUDGET   Max tokens injected per step (default: 500)
 #   CRIB_DB               Crib database path (crib's default if unset)
-#   CRIB_RERANK_THRESHOLD Reranker threshold (set to -1 internally for speed)
+#   CRIB_RERANK_THRESHOLD Reranker threshold (passed through to crib if set)
 #
 # Dependencies: ruby (socket, json, net/http, open3, uri, digest — stdlib only)
 #
@@ -103,8 +103,8 @@ end
 # MemoryRetriever — wraps `crib retrieve` via Process.spawn
 # ---------------------------------------------------------------------------
 # Passes query text on stdin. Returns a hash with :text (the raw crib output)
-# and :hash (SHA256 of the entire block for dedup). Disables the reranker for
-# speed. Returns nil on any error or timeout.
+# and :hash (SHA256 of the entire block for dedup). Returns nil on any error
+# or timeout.
 
 class MemoryRetriever
   TIMEOUT = 10 # seconds
@@ -112,7 +112,7 @@ class MemoryRetriever
   def retrieve(query)
     return nil if query.nil? || query.strip.empty?
 
-    env = { 'CRIB_RERANK_THRESHOLD' => '-1' }
+    env = {}
     env['CRIB_DB'] = ENV['CRIB_DB'] if ENV['CRIB_DB']
 
     in_r, in_w = IO.pipe
