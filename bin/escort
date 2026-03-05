@@ -338,6 +338,11 @@ class EscortProxy
 
   private
 
+  def log_request(**fields)
+    parts = fields.compact.map { |k, v| "#{k}=#{v}" }
+    $stderr.puts "escort: #{parts.join(' ')}"
+  end
+
   def start_file_watcher(server)
     path = File.expand_path(__FILE__)
     mtime = File.mtime(path)
@@ -379,8 +384,6 @@ class EscortProxy
     headers = read_headers(client)
     body_raw = read_body(client, headers)
 
-    $stderr.puts "escort: [conn] #{method} #{path} (#{body_raw&.bytesize || 0} bytes)"
-
     # Health check
     if method == 'GET' && path == '/health'
       serve_health(client)
@@ -411,62 +414,36 @@ class EscortProxy
     end
 
     messages = body['messages']
-
-    # Extract session ID from metadata.user_id (contains session_<UUID>)
     session_id = extract_session_id(body)
-    $stderr.puts "escort: #{messages.size} msgs, model=#{body['model']}, session=#{session_id || 'unknown'}"
-
-    # Log message structure
-    messages.each_with_index do |msg, i|
-      content = msg['content']
-      case content
-      when String
-        $stderr.puts "escort:   [#{i}] #{msg['role']} string(#{content.length})"
-      when Array
-        types = content.map { |b| b.is_a?(Hash) ? "#{b['type']}(#{(b['text'] || b['source']&.to_s || '')[0..40]})" : b.class.name }
-        $stderr.puts "escort:   [#{i}] #{msg['role']} array(#{content.size}) #{types.join(', ')}"
-      end
-    end
-
-    # Extract query from last user message
     query = RequestModifier.extract_query(body)
-    $stderr.puts "escort: query=#{query ? "#{query.length} chars: #{query[0..80]}" : 'nil'}"
 
-    unless query
-      $stderr.puts "escort: no query extracted, passing through"
+    # Shortcut: no query or no session → passthrough
+    unless query && session_id
+      log_request(messages: messages.size, model: body['model'], query: nil, action: 'passthrough')
       StreamForwarder.forward(client, method, path, headers, body_raw)
       return
     end
 
-    unless session_id
-      $stderr.puts "escort: no session ID, passing through"
-      StreamForwarder.forward(client, method, path, headers, body_raw)
-      return
-    end
-
+    started_at = Time.now
     result = @retriever.retrieve(query)
+    crib_ms = ((Time.now - started_at) * 1000).round
 
-    if result
-      if @dedup.seen?(session_id, result[:hash])
-        $stderr.puts "escort: memory block already injected, skipping"
-      else
-        # Crib output includes <memory> tags — pass through as-is
-        body = RequestModifier.inject_memory(body, result[:text])
-        @dedup.record(session_id, result[:hash])
-
-        $stderr.puts "escort: injected memory block (#{result[:text].bytesize} bytes) [session=#{session_id}]"
-
-        # Re-serialize and forward modified body
-        modified_raw = JSON.generate(body)
-        StreamForwarder.forward(client, method, path, headers, modified_raw)
-        return
-      end
+    if result && !@dedup.seen?(session_id, result[:hash])
+      body = RequestModifier.inject_memory(body, result[:text])
+      @dedup.record(session_id, result[:hash])
+      modified_raw = JSON.generate(body)
+      log_request(messages: messages.size, model: body['model'], query: query.length,
+                  crib_ms: crib_ms, injected: result[:text].bytesize, action: 'injected')
+      StreamForwarder.forward(client, method, path, headers, modified_raw)
+    elsif result
+      log_request(messages: messages.size, model: body['model'], query: query.length,
+                  crib_ms: crib_ms, action: 'dedup')
+      StreamForwarder.forward(client, method, path, headers, body_raw)
     else
-      $stderr.puts "escort: crib returned no results"
+      log_request(messages: messages.size, model: body['model'], query: query.length,
+                  crib_ms: crib_ms, action: 'no_results')
+      StreamForwarder.forward(client, method, path, headers, body_raw)
     end
-
-    # No injection — forward original request
-    StreamForwarder.forward(client, method, path, headers, body_raw)
   end
 
   # Extract session UUID from metadata.user_id field.
