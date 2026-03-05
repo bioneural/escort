@@ -47,38 +47,40 @@ BUDGET   = Integer(ENV.fetch('ESCORT_TOKEN_BUDGET', '500'))
 # ---------------------------------------------------------------------------
 # DedupTracker — per-session deduplication of injected memories
 # ---------------------------------------------------------------------------
-# Tracks which memory hashes have been injected per Claude Code session.
+# Tracks which memory blocks have been injected per Claude Code session.
 # Session ID is extracted from body['metadata']['user_id'], which contains
 # a unique `session_<UUID>` suffix. Each session gets its own dedup set so
 # parallel sessions (different projects, different terminals) don't suppress
-# each other's memories. Stale sessions are cleaned after 1 hour of inactivity.
+# each other's memories. Block-level dedup: the entire crib response is hashed
+# as one unit. If the same block was already injected, it is skipped.
+# Stale sessions are cleaned after 1 hour of inactivity.
 
 class DedupTracker
   STALE_SECONDS = 3600 # 1 hour
 
   def initialize
-    @sessions = {}  # session_id => { injected: Set, seen_at: Time }
+    @sessions = {}  # session_id => { injected: Set<String>, seen_at: Time }
     @mutex = Mutex.new
     start_cleaner
   end
 
-  def injected(session_id)
+  def seen?(session_id, block_hash)
     @mutex.synchronize do
       entry = @sessions[session_id]
       if entry
         entry[:seen_at] = Time.now
-        entry[:injected]
+        entry[:injected].include?(block_hash)
       else
-        Set.new
+        false
       end
     end
   end
 
-  def record(session_id, hashes)
+  def record(session_id, block_hash)
     @mutex.synchronize do
       entry = @sessions[session_id] ||= { injected: Set.new, seen_at: Time.now }
       entry[:seen_at] = Time.now
-      entry[:injected].merge(hashes)
+      entry[:injected].add(block_hash)
     end
   end
 
@@ -100,9 +102,9 @@ end
 # ---------------------------------------------------------------------------
 # MemoryRetriever — wraps `crib retrieve` via Process.spawn
 # ---------------------------------------------------------------------------
-# Passes query text on stdin. Returns a hash with :text (the <memory> block)
-# and :hashes (SHA256 of individual memory lines for dedup). Disables the
-# reranker for speed. Returns nil on any error or timeout.
+# Passes query text on stdin. Returns a hash with :text (the raw crib output)
+# and :hash (SHA256 of the entire block for dedup). Disables the reranker for
+# speed. Returns nil on any error or timeout.
 
 class MemoryRetriever
   TIMEOUT = 10 # seconds
@@ -155,10 +157,8 @@ class MemoryRetriever
 
     return nil if stdout.nil? || stdout.strip.empty?
 
-    lines = stdout.strip.lines.map(&:strip).reject(&:empty?)
-    hashes = lines.map { |l| Digest::SHA256.hexdigest(l) }.to_set
-
-    { text: stdout.strip, hashes: hashes }
+    text = stdout.strip
+    { text: text, hash: Digest::SHA256.hexdigest(text) }
   rescue => e
     $stderr.puts "escort: crib retrieve error: #{e.message}"
     nil
@@ -169,8 +169,9 @@ end
 # RequestModifier — extracts query and injects memory into request body
 # ---------------------------------------------------------------------------
 # Query: last 500 chars of text content from the last user-role message.
-# Injection: appends <memory> tags to the last text block in the last
-# user-role message. No structural changes — just appends to existing text.
+# Injection: appends a new text content block to the last user-role message's
+# content array. String content is normalized to array form first. The memory
+# block is a separate content block — never appended to existing text.
 
 module RequestModifier
   module_function
@@ -203,15 +204,15 @@ module RequestModifier
     msg = messages[last_user_idx]
     content = msg['content']
 
+    # Normalize string content to array form
     case content
     when String
-      msg['content'] = content + "\n\n" + memory_text
+      msg['content'] = [
+        { 'type' => 'text', 'text' => content },
+        { 'type' => 'text', 'text' => memory_text }
+      ]
     when Array
-      # Find the last text block and append to it
-      last_text = content.reverse.find { |b| b.is_a?(Hash) && b['type'] == 'text' }
-      if last_text
-        last_text['text'] = last_text['text'] + "\n\n" + memory_text
-      end
+      content.push({ 'type' => 'text', 'text' => memory_text })
     end
 
     body
@@ -440,36 +441,19 @@ class EscortProxy
     result = @retriever.retrieve(query)
 
     if result
-      # Filter out already-injected memories for this session
-      new_hashes = result[:hashes] - @dedup.injected(session_id)
-
-      if new_hashes.any?
-        # Filter memory text to only new lines
-        new_lines = result[:text].lines.select do |line|
-          h = Digest::SHA256.hexdigest(line.strip)
-          new_hashes.include?(h)
-        end
-
-        if new_lines.any?
-          memory_text = new_lines.join
-          # Truncate to budget (rough token estimate: 4 chars per token)
-          max_chars = BUDGET * 4
-          if memory_text.bytesize > max_chars
-            memory_text = memory_text[0, max_chars]
-          end
-
-          body = RequestModifier.inject_memory(body, "<memory>\n#{memory_text}\n</memory>")
-          @dedup.record(session_id, new_hashes)
-
-          $stderr.puts "escort: injected #{new_hashes.size} new memory line(s) [session=#{session_id}]"
-
-          # Re-serialize and forward modified body
-          modified_raw = JSON.generate(body)
-          StreamForwarder.forward(client, method, path, headers, modified_raw)
-          return
-        end
+      if @dedup.seen?(session_id, result[:hash])
+        $stderr.puts "escort: memory block already injected, skipping"
       else
-        $stderr.puts "escort: all memories already injected, skipping"
+        # Crib output includes <memory> tags — pass through as-is
+        body = RequestModifier.inject_memory(body, result[:text])
+        @dedup.record(session_id, result[:hash])
+
+        $stderr.puts "escort: injected memory block (#{result[:text].bytesize} bytes) [session=#{session_id}]"
+
+        # Re-serialize and forward modified body
+        modified_raw = JSON.generate(body)
+        StreamForwarder.forward(client, method, path, headers, modified_raw)
+        return
       end
     else
       $stderr.puts "escort: crib returned no results"
