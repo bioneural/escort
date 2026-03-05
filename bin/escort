@@ -112,6 +112,8 @@ class MemoryRetriever
   def retrieve(query)
     return nil if query.nil? || query.strip.empty?
 
+    started_at = Time.now
+
     env = {}
     env['CRIB_DB'] = ENV['CRIB_DB'] if ENV['CRIB_DB']
 
@@ -139,11 +141,14 @@ class MemoryRetriever
         Process.kill('KILL', pid) rescue nil
         Process.waitpid2(pid) rescue nil
         [out_r, err_r].each { |io| io.close rescue nil }
-        $stderr.puts "escort: crib retrieve timed out (#{TIMEOUT}s)"
+        elapsed = ((Time.now - started_at) * 1000).round
+        $stderr.puts "escort: crib retrieve timed out (#{TIMEOUT}s, #{elapsed}ms elapsed)"
         return nil
       end
       sleep 0.05
     end
+
+    elapsed = ((Time.now - started_at) * 1000).round
 
     stdout = out_r.read
     out_r.close
@@ -151,13 +156,14 @@ class MemoryRetriever
     err_r.close
 
     unless status.success?
-      $stderr.puts "escort: crib retrieve failed: #{err_str}" unless err_str.empty?
+      $stderr.puts "escort: crib retrieve failed (#{elapsed}ms): #{err_str}" unless err_str.empty?
       return nil
     end
 
     return nil if stdout.nil? || stdout.strip.empty?
 
     text = stdout.strip
+    $stderr.puts "escort: crib retrieve completed (#{elapsed}ms, #{text.bytesize} bytes)"
     { text: text, hash: Digest::SHA256.hexdigest(text) }
   rescue => e
     $stderr.puts "escort: crib retrieve error: #{e.message}"
