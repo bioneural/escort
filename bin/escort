@@ -1,0 +1,561 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/escort — API proxy for per-step memory retrieval
+#
+# Purpose:
+#   Transparent proxy between Claude Code and the Anthropic API. Intercepts
+#   every POST /v1/messages request (one per reasoning step) and injects
+#   relevant memories from crib. During multi-step agentic loops — where no
+#   human prompt triggers UserPromptSubmit — this is how fresh context reaches
+#   the agent mid-chain.
+#
+# Usage:
+#   bin/escort &
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:7710 claude
+#
+# Environment:
+#   ESCORT_PORT           Listen port (default: 7710)
+#   ESCORT_UPSTREAM       Upstream API URL (default: https://api.anthropic.com)
+#   ESCORT_CRIB           Crib binary path (default: sibling ../../crib/bin/crib)
+#   ESCORT_TOKEN_BUDGET   Max tokens injected per step (default: 500)
+#   CRIB_DB               Crib database path (crib's default if unset)
+#   CRIB_RERANK_THRESHOLD Reranker threshold (set to -1 internally for speed)
+#
+# Dependencies: ruby (socket, json, net/http, open3, uri, digest — stdlib only)
+#
+# Behavior:
+#   1. Binds TCPServer on 127.0.0.1:PORT
+#   2. Thread-per-connection
+#   3. POST /v1/messages: parse body, retrieve memories, inject, forward, stream back
+#   4. GET /health: return 200 OK with status JSON
+#   5. Everything else: passthrough to upstream unchanged
+#   6. Fail-open: any error in retrieval/injection skips injection silently
+
+require 'socket'
+require 'json'
+require 'net/http'
+require 'open3'
+require 'uri'
+require 'digest'
+
+PORT     = Integer(ENV.fetch('ESCORT_PORT', '7710'))
+UPSTREAM = URI.parse(ENV.fetch('ESCORT_UPSTREAM', 'https://api.anthropic.com'))
+CRIB     = ENV.fetch('ESCORT_CRIB', File.expand_path('../../crib/bin/crib', __dir__))
+BUDGET   = Integer(ENV.fetch('ESCORT_TOKEN_BUDGET', '500'))
+
+# ---------------------------------------------------------------------------
+# DedupTracker — per-session deduplication of injected memories
+# ---------------------------------------------------------------------------
+# Tracks which memory hashes have been injected per Claude Code session.
+# Session ID is extracted from body['metadata']['user_id'], which contains
+# a unique `session_<UUID>` suffix. Each session gets its own dedup set so
+# parallel sessions (different projects, different terminals) don't suppress
+# each other's memories. Stale sessions are cleaned after 1 hour of inactivity.
+
+class DedupTracker
+  STALE_SECONDS = 3600 # 1 hour
+
+  def initialize
+    @sessions = {}  # session_id => { injected: Set, seen_at: Time }
+    @mutex = Mutex.new
+    start_cleaner
+  end
+
+  def injected(session_id)
+    @mutex.synchronize do
+      entry = @sessions[session_id]
+      if entry
+        entry[:seen_at] = Time.now
+        entry[:injected]
+      else
+        Set.new
+      end
+    end
+  end
+
+  def record(session_id, hashes)
+    @mutex.synchronize do
+      entry = @sessions[session_id] ||= { injected: Set.new, seen_at: Time.now }
+      entry[:seen_at] = Time.now
+      entry[:injected].merge(hashes)
+    end
+  end
+
+  private
+
+  def start_cleaner
+    Thread.new do
+      loop do
+        sleep 300
+        @mutex.synchronize do
+          now = Time.now
+          @sessions.delete_if { |_, v| now - v[:seen_at] > STALE_SECONDS }
+        end
+      end
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# MemoryRetriever — wraps `crib retrieve` via Process.spawn
+# ---------------------------------------------------------------------------
+# Passes query text on stdin. Returns a hash with :text (the <memory> block)
+# and :hashes (SHA256 of individual memory lines for dedup). Disables the
+# reranker for speed. Returns nil on any error or timeout.
+
+class MemoryRetriever
+  TIMEOUT = 10 # seconds
+
+  def retrieve(query)
+    return nil if query.nil? || query.strip.empty?
+
+    env = { 'CRIB_RERANK_THRESHOLD' => '-1' }
+    env['CRIB_DB'] = ENV['CRIB_DB'] if ENV['CRIB_DB']
+
+    in_r, in_w = IO.pipe
+    out_r, out_w = IO.pipe
+    err_r, err_w = IO.pipe
+
+    pid = Process.spawn(env, CRIB, 'retrieve', in: in_r, out: out_w, err: err_w)
+    in_r.close
+    out_w.close
+    err_w.close
+
+    in_w.write(query)
+    in_w.close
+
+    # Poll for process exit with timeout
+    deadline = Time.now + TIMEOUT
+    status = nil
+    loop do
+      _, status = Process.waitpid2(pid, Process::WNOHANG)
+      break if status
+      if Time.now > deadline
+        Process.kill('TERM', pid) rescue nil
+        sleep 0.1
+        Process.kill('KILL', pid) rescue nil
+        Process.waitpid2(pid) rescue nil
+        [out_r, err_r].each { |io| io.close rescue nil }
+        $stderr.puts "escort: crib retrieve timed out (#{TIMEOUT}s)"
+        return nil
+      end
+      sleep 0.05
+    end
+
+    stdout = out_r.read
+    out_r.close
+    err_str = err_r.read
+    err_r.close
+
+    unless status.success?
+      $stderr.puts "escort: crib retrieve failed: #{err_str}" unless err_str.empty?
+      return nil
+    end
+
+    return nil if stdout.nil? || stdout.strip.empty?
+
+    lines = stdout.strip.lines.map(&:strip).reject(&:empty?)
+    hashes = lines.map { |l| Digest::SHA256.hexdigest(l) }.to_set
+
+    { text: stdout.strip, hashes: hashes }
+  rescue => e
+    $stderr.puts "escort: crib retrieve error: #{e.message}"
+    nil
+  end
+end
+
+# ---------------------------------------------------------------------------
+# RequestModifier — extracts query and injects memory into request body
+# ---------------------------------------------------------------------------
+# Query: last 500 chars of text content from the last user-role message.
+# Injection: appends <memory> tags to the last text block in the last
+# user-role message. No structural changes — just appends to existing text.
+
+module RequestModifier
+  module_function
+
+  def extract_query(body)
+    messages = body['messages']
+    return nil unless messages.is_a?(Array) && !messages.empty?
+
+    last_user = messages.reverse.find { |m| m['role'] == 'user' }
+    return nil unless last_user
+
+    content = last_user['content']
+    text = case content
+           when String then content
+           when Array
+             content.filter_map { |c| c['text'] if c.is_a?(Hash) && c['type'] == 'text' }.join(' ')
+           end
+    return nil if text.nil? || text.strip.empty?
+
+    text[-500..]
+  end
+
+  def inject_memory(body, memory_text)
+    messages = body['messages']
+    return body unless messages.is_a?(Array)
+
+    last_user_idx = messages.rindex { |m| m['role'] == 'user' }
+    return body unless last_user_idx
+
+    msg = messages[last_user_idx]
+    content = msg['content']
+
+    case content
+    when String
+      msg['content'] = content + "\n\n" + memory_text
+    when Array
+      # Find the last text block and append to it
+      last_text = content.reverse.find { |b| b.is_a?(Hash) && b['type'] == 'text' }
+      if last_text
+        last_text['text'] = last_text['text'] + "\n\n" + memory_text
+      end
+    end
+
+    body
+  end
+end
+
+# ---------------------------------------------------------------------------
+# StreamForwarder — forwards request to upstream and streams response back
+# ---------------------------------------------------------------------------
+# Uses Net::HTTP with SSL. Streams response chunks byte-by-byte back to the
+# client socket. 300s read timeout for long streaming responses.
+
+module StreamForwarder
+  module_function
+
+  def forward(client, method, path, headers, body)
+    http = Net::HTTP.new(UPSTREAM.host, UPSTREAM.port)
+    http.use_ssl = (UPSTREAM.scheme == 'https')
+    http.read_timeout = 300
+    http.open_timeout = 30
+
+    req = case method
+          when 'GET'    then Net::HTTP::Get.new(path)
+          when 'POST'   then Net::HTTP::Post.new(path)
+          when 'PUT'    then Net::HTTP::Put.new(path)
+          when 'DELETE' then Net::HTTP::Delete.new(path)
+          else               Net::HTTP::Post.new(path)
+          end
+
+    # Forward headers, skip hop-by-hop
+    skip = %w[host connection transfer-encoding content-length]
+    headers.each do |k, v|
+      req[k] = v unless skip.include?(k.downcase)
+    end
+    req['host'] = UPSTREAM.host
+
+    if body && !body.empty?
+      req.body = body
+      req['content-length'] = body.bytesize.to_s
+    end
+
+    http.request(req) do |response|
+      # Write status line
+      client.write("HTTP/1.1 #{response.code} #{response.message}\r\n")
+
+      # Write headers
+      response.each_header do |k, v|
+        # Skip hop-by-hop headers
+        next if %w[transfer-encoding connection].include?(k.downcase)
+        client.write("#{k}: #{v}\r\n")
+      end
+      client.write("\r\n")
+
+      # Stream body
+      response.read_body do |chunk|
+        client.write(chunk)
+      end
+    end
+  rescue => e
+    $stderr.puts "escort: upstream error: #{e.class}: #{e.message}"
+    write_error(client, 502, "Upstream error: #{e.message}")
+  end
+
+  def write_error(client, code, message)
+    body = JSON.generate({ error: { type: 'proxy_error', message: message } })
+    client.write("HTTP/1.1 #{code} Bad Gateway\r\n")
+    client.write("Content-Type: application/json\r\n")
+    client.write("Content-Length: #{body.bytesize}\r\n")
+    client.write("Connection: close\r\n")
+    client.write("\r\n")
+    client.write(body)
+  rescue
+    # Client may have disconnected
+  end
+end
+
+# ---------------------------------------------------------------------------
+# EscortProxy — TCPServer on 127.0.0.1:PORT, thread-per-connection
+# ---------------------------------------------------------------------------
+
+class EscortProxy
+  DRAIN_TIMEOUT = 30 # seconds to wait for active connections before forcing restart
+
+  def initialize
+    @dedup = DedupTracker.new
+    @retriever = MemoryRetriever.new
+    @active = 0
+    @active_mutex = Mutex.new
+  end
+
+  def start
+    server = TCPServer.new('127.0.0.1', PORT)
+    $stderr.puts "escort: listening on 127.0.0.1:#{PORT}"
+    $stderr.puts "escort: upstream #{UPSTREAM}"
+    $stderr.puts "escort: crib #{CRIB}"
+
+    start_file_watcher(server)
+
+    loop do
+      client = server.accept rescue next
+      Thread.new(client) do |c|
+        @active_mutex.synchronize { @active += 1 }
+        handle_connection(c)
+      rescue => e
+        $stderr.puts "escort: #{e.class}: #{e.message}"
+      ensure
+        @active_mutex.synchronize { @active -= 1 }
+        c.close rescue nil
+      end
+    end
+  rescue Interrupt
+    $stderr.puts "\nescort: shutting down"
+  rescue => e
+    $stderr.puts "escort: fatal: #{e.message}"
+    raise
+  end
+
+  private
+
+  def start_file_watcher(server)
+    path = File.expand_path(__FILE__)
+    mtime = File.mtime(path)
+    Thread.new do
+      loop do
+        sleep 2
+        current = File.mtime(path) rescue next
+        next if current == mtime
+
+        $stderr.puts "escort: code changed, draining..."
+        # Stop accepting new connections — supervisor will start a fresh worker
+        server.close rescue nil
+
+        # Wait for active connections to finish
+        deadline = Time.now + DRAIN_TIMEOUT
+        loop do
+          count = @active_mutex.synchronize { @active }
+          break if count == 0
+          if Time.now > deadline
+            $stderr.puts "escort: drain timeout (#{count} active), exiting anyway"
+            break
+          end
+          sleep 0.25
+        end
+
+        $stderr.puts "escort: worker exiting for restart"
+        exit(0)
+      end
+    end
+  end
+
+  def handle_connection(client)
+    request_line = client.gets("\n")
+    return unless request_line
+
+    method, path, = request_line.split(' ', 3)
+    return unless method && path
+
+    headers = read_headers(client)
+    body_raw = read_body(client, headers)
+
+    $stderr.puts "escort: [conn] #{method} #{path} (#{body_raw&.bytesize || 0} bytes)"
+
+    # Health check
+    if method == 'GET' && path == '/health'
+      serve_health(client)
+      return
+    end
+
+    # Intercept POST /v1/messages
+    if method == 'POST' && path =~ %r{^/v1/messages(\?|$)}
+      handle_messages(client, method, path, headers, body_raw)
+    else
+      # Passthrough
+      StreamForwarder.forward(client, method, path, headers, body_raw)
+    end
+  end
+
+  def handle_messages(client, method, path, headers, body_raw)
+    body = nil
+    begin
+      body = JSON.parse(body_raw) if body_raw && !body_raw.empty?
+    rescue JSON::ParserError => e
+      $stderr.puts "escort: JSON parse error, passing through: #{e.message}"
+    end
+
+    # If we can't parse the body, pass through unmodified
+    unless body.is_a?(Hash) && body['messages'].is_a?(Array)
+      StreamForwarder.forward(client, method, path, headers, body_raw)
+      return
+    end
+
+    messages = body['messages']
+
+    # Extract session ID from metadata.user_id (contains session_<UUID>)
+    session_id = extract_session_id(body)
+    $stderr.puts "escort: #{messages.size} msgs, model=#{body['model']}, session=#{session_id || 'unknown'}"
+
+    # Log message structure
+    messages.each_with_index do |msg, i|
+      content = msg['content']
+      case content
+      when String
+        $stderr.puts "escort:   [#{i}] #{msg['role']} string(#{content.length})"
+      when Array
+        types = content.map { |b| b.is_a?(Hash) ? "#{b['type']}(#{(b['text'] || b['source']&.to_s || '')[0..40]})" : b.class.name }
+        $stderr.puts "escort:   [#{i}] #{msg['role']} array(#{content.size}) #{types.join(', ')}"
+      end
+    end
+
+    # Extract query from last user message
+    query = RequestModifier.extract_query(body)
+    $stderr.puts "escort: query=#{query ? "#{query.length} chars: #{query[0..80]}" : 'nil'}"
+
+    unless query
+      $stderr.puts "escort: no query extracted, passing through"
+      StreamForwarder.forward(client, method, path, headers, body_raw)
+      return
+    end
+
+    unless session_id
+      $stderr.puts "escort: no session ID, passing through"
+      StreamForwarder.forward(client, method, path, headers, body_raw)
+      return
+    end
+
+    result = @retriever.retrieve(query)
+
+    if result
+      # Filter out already-injected memories for this session
+      new_hashes = result[:hashes] - @dedup.injected(session_id)
+
+      if new_hashes.any?
+        # Filter memory text to only new lines
+        new_lines = result[:text].lines.select do |line|
+          h = Digest::SHA256.hexdigest(line.strip)
+          new_hashes.include?(h)
+        end
+
+        if new_lines.any?
+          memory_text = new_lines.join
+          # Truncate to budget (rough token estimate: 4 chars per token)
+          max_chars = BUDGET * 4
+          if memory_text.bytesize > max_chars
+            memory_text = memory_text[0, max_chars]
+          end
+
+          body = RequestModifier.inject_memory(body, "<memory>\n#{memory_text}\n</memory>")
+          @dedup.record(session_id, new_hashes)
+
+          $stderr.puts "escort: injected #{new_hashes.size} new memory line(s) [session=#{session_id}]"
+
+          # Re-serialize and forward modified body
+          modified_raw = JSON.generate(body)
+          StreamForwarder.forward(client, method, path, headers, modified_raw)
+          return
+        end
+      else
+        $stderr.puts "escort: all memories already injected, skipping"
+      end
+    else
+      $stderr.puts "escort: crib returned no results"
+    end
+
+    # No injection — forward original request
+    StreamForwarder.forward(client, method, path, headers, body_raw)
+  end
+
+  # Extract session UUID from metadata.user_id field.
+  # Format: "user_<hash>_account_<uuid>_session_<uuid>"
+  def extract_session_id(body)
+    user_id = body.dig('metadata', 'user_id')
+    return nil unless user_id.is_a?(String)
+
+    match = user_id.match(/session_([0-9a-f-]+)\z/)
+    match ? match[1] : nil
+  end
+
+  def serve_health(client)
+    crib_ok = File.executable?(CRIB)
+    body = JSON.generate({
+      status: 'ok',
+      port: PORT,
+      upstream: UPSTREAM.to_s,
+      crib: CRIB,
+      crib_available: crib_ok
+    })
+    client.write("HTTP/1.1 200 OK\r\n")
+    client.write("Content-Type: application/json\r\n")
+    client.write("Content-Length: #{body.bytesize}\r\n")
+    client.write("Connection: close\r\n")
+    client.write("\r\n")
+    client.write(body)
+  end
+
+  def read_headers(client)
+    headers = {}
+    loop do
+      line = client.gets("\n")
+      break if line.nil? || line.strip.empty?
+      key, value = line.split(':', 2)
+      headers[key.strip.downcase] = value.strip if key && value
+    end
+    headers
+  end
+
+  MAX_BODY_SIZE = 10_485_760 # 10 MB — API requests can be large
+
+  def read_body(client, headers)
+    length = headers['content-length']&.to_i
+    return nil unless length && length > 0
+    return nil if length > MAX_BODY_SIZE
+    client.read(length)
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Main — supervisor / worker split
+# ---------------------------------------------------------------------------
+# Supervisor: forks a worker child, waits for it to exit, restarts.
+# Worker: runs the actual proxy. Exits on code change (file watcher) or crash.
+# The supervisor always re-execs the file, so the worker gets fresh code.
+
+if ENV['ESCORT_WORKER']
+  EscortProxy.new.start
+else
+  $stderr.puts "escort: supervisor starting (pid #{Process.pid})"
+  failures = 0
+  loop do
+    started_at = Time.now
+    pid = fork do
+      ENV['ESCORT_WORKER'] = '1'
+      exec(RbConfig.ruby, File.expand_path(__FILE__))
+    end
+    _, status = Process.waitpid2(pid)
+
+    # If worker ran for >5s, it was healthy — reset backoff
+    if Time.now - started_at > 5
+      failures = 0
+    else
+      failures += 1
+    end
+
+    delay = [0.5 * (2**failures), 30].min
+    $stderr.puts "escort: worker #{pid} exited (#{status}), restarting in #{delay}s..."
+    sleep delay
+  end
+end

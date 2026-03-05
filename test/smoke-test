@@ -1,0 +1,94 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# test/smoke-test — end-to-end verification of escort happy paths
+#
+# Usage:
+#   test/smoke-test
+#
+# Dependencies: ruby (stdlib only)
+
+ESCORT_ROOT = File.expand_path('..', __dir__)
+Dir.chdir(ESCORT_ROOT)
+
+passed  = 0
+failed  = 0
+failures = []
+
+def pass(msg)
+  $stdout.puts "  \u2713 #{msg}"
+end
+
+def fail(msg, detail = nil)
+  $stdout.puts "  \u2717 #{msg}#{detail ? " — #{detail}" : ''}"
+end
+
+# ---------------------------------------------------------------------------
+# Structure
+# ---------------------------------------------------------------------------
+$stdout.puts "\nStructure"
+
+paths = %w[bin/escort LICENSE README.md test/smoke-test]
+missing = paths.reject { |p| File.exist?(p) }
+if missing.empty?
+  pass 'All expected paths exist'
+  passed += 1
+else
+  fail 'Missing paths', missing.join(', ')
+  failed += 1
+  failures << 'structure'
+end
+
+# ---------------------------------------------------------------------------
+# Executable
+# ---------------------------------------------------------------------------
+$stdout.puts "\nExecutable"
+
+if File.executable?('bin/escort')
+  pass 'bin/escort is executable'
+  passed += 1
+else
+  fail 'bin/escort', 'not executable'
+  failed += 1
+  failures << 'executable'
+end
+
+if File.executable?('test/smoke-test')
+  pass 'test/smoke-test is executable'
+  passed += 1
+else
+  fail 'test/smoke-test', 'not executable'
+  failed += 1
+  failures << 'smoke-test executable'
+end
+
+# ---------------------------------------------------------------------------
+# Syntax
+# ---------------------------------------------------------------------------
+$stdout.puts "\nSyntax"
+
+require 'open3'
+_, st = Open3.capture2e('ruby', '-c', 'bin/escort')
+if st.success?
+  pass 'bin/escort passes syntax check'
+  passed += 1
+else
+  fail 'bin/escort', 'syntax error'
+  failed += 1
+  failures << 'syntax'
+end
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+$stdout.puts
+$stdout.puts "\u2501" * 41
+parts = ["#{passed} passed"]
+parts << "#{failed} failed" if failed > 0
+$stdout.puts parts.join(', ')
+
+if failures.any?
+  $stdout.puts "failures: #{failures.join(', ')}"
+end
+
+exit(failed == 0 ? 0 : 1)
