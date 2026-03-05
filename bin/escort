@@ -528,14 +528,27 @@ if ENV['ESCORT_WORKER']
   EscortProxy.new.start
 else
   $stderr.puts "escort: supervisor starting (pid #{Process.pid})"
+  worker_pid = nil
+
+  # Propagate termination signals to the worker
+  %w[INT TERM].each do |sig|
+    Signal.trap(sig) do
+      if worker_pid
+        Process.kill(sig, worker_pid) rescue nil
+        Process.waitpid2(worker_pid) rescue nil
+      end
+      exit(0)
+    end
+  end
+
   failures = 0
   loop do
     started_at = Time.now
-    pid = fork do
+    worker_pid = fork do
       ENV['ESCORT_WORKER'] = '1'
       exec(RbConfig.ruby, File.expand_path(__FILE__))
     end
-    _, status = Process.waitpid2(pid)
+    _, status = Process.waitpid2(worker_pid)
 
     # If worker ran for >5s, it was healthy — reset backoff
     if Time.now - started_at > 5
@@ -545,7 +558,7 @@ else
     end
 
     delay = [0.5 * (2**failures), 30].min
-    $stderr.puts "escort: worker #{pid} exited (#{status}), restarting in #{delay}s..."
+    $stderr.puts "escort: worker #{worker_pid} exited (#{status}), restarting in #{delay}s..."
     sleep delay
   end
 end
