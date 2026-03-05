@@ -4,9 +4,9 @@
   <sub>API proxy for per-step memory retrieval</sub>
 </h1>
 
-Memory retrieval fires once — when a human submits a prompt. During multi-step agentic loops, where the model reasons across dozens of tool calls without human input, no new context arrives. Decisions made three steps ago are invisible by step ten. escort solves this at the transport layer: a transparent proxy that intercepts every API request and injects relevant memories mid-chain.
+A transparent proxy that sits between Claude Code and the Anthropic API. escort intercepts every `POST /v1/messages` request — one per reasoning step — and injects relevant memories from [crib](https://github.com/bioneural/crib) before forwarding to upstream. Every step gets fresh context. Per-session dedup prevents re-injection. Fail-open design means a broken retrieval never blocks the agent.
 
-A single script. Ruby stdlib only. No gems, no API keys. Sits between Claude Code and the Anthropic API on localhost.
+A single script. Ruby stdlib only. No gems, no API keys.
 
 ---
 
