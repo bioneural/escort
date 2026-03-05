@@ -530,13 +530,12 @@ else
   $stderr.puts "escort: supervisor starting (pid #{Process.pid})"
   worker_pid = nil
 
-  # Propagate termination signals to the worker
+  # Propagate termination signals to the worker.
+  # No waitpid in the handler — the main loop is already blocked in waitpid,
+  # and re-entering it from a signal handler deadlocks.
   %w[INT TERM].each do |sig|
     Signal.trap(sig) do
-      if worker_pid
-        Process.kill(sig, worker_pid) rescue nil
-        Process.waitpid2(worker_pid) rescue nil
-      end
+      Process.kill(sig, worker_pid) rescue nil if worker_pid
       exit(0)
     end
   end
