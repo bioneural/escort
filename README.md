@@ -110,8 +110,21 @@ curl http://127.0.0.1:7710/health
 | `ESCORT_PORT` | `7710` | Listen port |
 | `ESCORT_UPSTREAM` | `https://api.anthropic.com` | Upstream API URL |
 | `ESCORT_CRIB` | sibling `../../crib/bin/crib` | Path to crib binary |
-| `ESCORT_TOKEN_BUDGET` | `500` | Max tokens injected per step |
 | `CRIB_DB` | crib's default | Path to crib database |
+| `ESCORT_FORMATION_INTERVAL` | `300` | Seconds between formation extraction runs |
+| `ESCORT_CACHE_MAX` | `50` | Maximum total entries in the conversation cache |
+| `ESCORT_TRICK` | sibling `../../trick/bin/trick` | Path to trick binary for formation |
+| `ESCORT_STATE_DIR` | sibling `../../.state/escort` | State directory for kill switch |
+
+---
+
+## Memory formation
+
+escort includes a background memory formation worker that extracts knowledge from cached conversations. During normal operation, user messages are cached per session. Every `ESCORT_FORMATION_INTERVAL` seconds, the FormationWorker drains cached messages and spawns [trick](https://github.com/bioneural/trick) to extract memories and write them to crib.
+
+A kill switch file at `.state/escort/formation-disabled` disables formation. The `GET /health` endpoint includes a `formation_enabled` field reflecting whether formation is active.
+
+When formation is enabled in escort, the trick PreCompact hook policy in prophet falls back to a no-op — escort handles extraction during normal operation, and trick runs only when escort is unavailable.
 
 ---
 
