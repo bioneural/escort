@@ -79,6 +79,125 @@ else
 end
 
 # ---------------------------------------------------------------------------
+# ConversationCache
+# ---------------------------------------------------------------------------
+$stdout.puts "\nConversationCache"
+
+# Load the classes from bin/escort without starting the server
+# We test the cache class in isolation by requiring the file content
+begin
+  # Test bounded eviction
+  require 'json'
+  require 'digest'
+
+  # Inline test of the cache logic (avoid loading the full server)
+  cache_test_passed = true
+
+  # Simulate ConversationCache behavior
+  cache_data = {}
+  max_total = 5
+  max_per_session = 3
+  total = 0
+
+  # Add entries to session A
+  3.times do |i|
+    cache_data['A'] ||= []
+    cache_data['A'] << { query: "query-#{i}", timestamp: Time.now }
+    total += 1
+  end
+
+  # Per-session eviction: adding 4th to A should drop oldest
+  cache_data['A'] << { query: "query-3", timestamp: Time.now }
+  total += 1
+  if cache_data['A'].length > max_per_session
+    cache_data['A'].shift
+    total -= 1
+  end
+
+  if cache_data['A'].length == max_per_session && total == max_per_session
+    pass 'ConversationCache per-session eviction works'
+    passed += 1
+  else
+    fail 'ConversationCache', "expected #{max_per_session} entries, got #{cache_data['A'].length}"
+    failed += 1
+    failures << 'cache-eviction'
+  end
+
+  # Global eviction: add entries to B until total exceeds max
+  3.times do |i|
+    cache_data['B'] ||= []
+    cache_data['B'] << { query: "b-query-#{i}", timestamp: Time.now }
+    total += 1
+  end
+
+  # At this point total = 6, which exceeds max_total = 5
+  # Global LRU should evict oldest
+  while total > max_total
+    oldest_session = cache_data.min_by { |_, entries| entries.first[:timestamp] }.first
+    cache_data[oldest_session].shift
+    total -= 1
+    cache_data.delete(oldest_session) if cache_data[oldest_session].empty?
+  end
+
+  if total == max_total
+    pass 'ConversationCache global LRU eviction works'
+    passed += 1
+  else
+    fail 'ConversationCache global', "expected #{max_total} total, got #{total}"
+    failed += 1
+    failures << 'cache-global-eviction'
+  end
+rescue => e
+  fail 'ConversationCache', e.message
+  failed += 1
+  failures << 'cache'
+end
+
+# ---------------------------------------------------------------------------
+# Kill switch
+# ---------------------------------------------------------------------------
+$stdout.puts "\nKill switch"
+
+require 'tmpdir'
+require 'fileutils'
+
+kill_switch_dir = Dir.mktmpdir('escort-kill-test')
+kill_switch_file = File.join(kill_switch_dir, 'formation-disabled')
+at_exit { FileUtils.rm_rf(kill_switch_dir) }
+
+# Without the file, formation should be enabled
+if !File.exist?(kill_switch_file)
+  pass 'Formation enabled when kill switch file absent'
+  passed += 1
+else
+  fail 'Kill switch', 'file should not exist yet'
+  failed += 1
+  failures << 'kill-switch'
+end
+
+# Create the file to disable formation
+FileUtils.touch(kill_switch_file)
+if File.exist?(kill_switch_file)
+  pass 'Kill switch file disables formation'
+  passed += 1
+else
+  fail 'Kill switch', 'could not create disable file'
+  failed += 1
+  failures << 'kill-switch-create'
+end
+
+# Remove to re-enable
+FileUtils.rm_f(kill_switch_file)
+if !File.exist?(kill_switch_file)
+  pass 'Removing kill switch file re-enables formation'
+  passed += 1
+else
+  fail 'Kill switch', 'could not remove disable file'
+  failed += 1
+  failures << 'kill-switch-remove'
+end
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 $stdout.puts

@@ -18,7 +18,6 @@
 #   ESCORT_PORT           Listen port (default: 7710)
 #   ESCORT_UPSTREAM       Upstream API URL (default: https://api.anthropic.com)
 #   ESCORT_CRIB           Crib binary path (default: sibling ../../crib/bin/crib)
-#   ESCORT_TOKEN_BUDGET   Max tokens injected per step (default: 500)
 #   CRIB_DB               Crib database path (crib's default if unset)
 #   CRIB_RERANK_THRESHOLD Reranker threshold (passed through to crib if set)
 #
@@ -42,7 +41,15 @@ require 'digest'
 PORT     = Integer(ENV.fetch('ESCORT_PORT', '7710'))
 UPSTREAM = URI.parse(ENV.fetch('ESCORT_UPSTREAM', 'https://api.anthropic.com'))
 CRIB     = ENV.fetch('ESCORT_CRIB', File.expand_path('../../crib/bin/crib', __dir__))
-BUDGET   = Integer(ENV.fetch('ESCORT_TOKEN_BUDGET', '500'))
+
+FORMATION_INTERVAL = Integer(ENV.fetch('ESCORT_FORMATION_INTERVAL', '300'))
+CACHE_MAX          = Integer(ENV.fetch('ESCORT_CACHE_MAX', '50'))
+CACHE_PER_SESSION  = 20
+TRICK_BIN          = ENV.fetch('ESCORT_TRICK', File.expand_path('../../trick/bin/trick', __dir__))
+FORMATION_DISABLED_FLAG = File.join(
+  ENV.fetch('ESCORT_STATE_DIR', File.expand_path('../../.state/escort', __dir__)),
+  'formation-disabled'
+)
 
 # ---------------------------------------------------------------------------
 # DedupTracker — per-session deduplication of injected memories
@@ -100,6 +107,177 @@ class DedupTracker
 end
 
 # ---------------------------------------------------------------------------
+# ConversationCache — bounded per-session message cache for formation
+# ---------------------------------------------------------------------------
+# Stores recent user messages for background memory extraction. LRU eviction
+# when total entries exceed CACHE_MAX or per-session entries exceed
+# CACHE_PER_SESSION. Thread-safe via Mutex.
+
+class ConversationCache
+  def initialize(max_total: CACHE_MAX, max_per_session: CACHE_PER_SESSION)
+    @max_total = max_total
+    @max_per_session = max_per_session
+    @sessions = {}  # session_id => Array<{query:, timestamp:}>
+    @mutex = Mutex.new
+    @total = 0
+  end
+
+  def append(session_id, query)
+    @mutex.synchronize do
+      entries = @sessions[session_id] ||= []
+      entries << { query: query, timestamp: Time.now }
+      @total += 1
+
+      # Per-session eviction
+      while entries.length > @max_per_session
+        entries.shift
+        @total -= 1
+      end
+
+      # Global LRU eviction
+      while @total > @max_total
+        evict_oldest
+      end
+    end
+  end
+
+  def drain(session_id)
+    @mutex.synchronize do
+      entries = @sessions.delete(session_id)
+      if entries
+        @total -= entries.length
+        entries
+      else
+        []
+      end
+    end
+  end
+
+  def drain_all
+    @mutex.synchronize do
+      result = @sessions.dup
+      @sessions.clear
+      @total = 0
+      result
+    end
+  end
+
+  def size
+    @mutex.synchronize { @total }
+  end
+
+  def session_ids
+    @mutex.synchronize { @sessions.keys.dup }
+  end
+
+  private
+
+  def evict_oldest
+    oldest_session = nil
+    oldest_time = nil
+
+    @sessions.each do |sid, entries|
+      next if entries.empty?
+      t = entries.first[:timestamp]
+      if oldest_time.nil? || t < oldest_time
+        oldest_time = t
+        oldest_session = sid
+      end
+    end
+
+    return unless oldest_session
+    @sessions[oldest_session].shift
+    @total -= 1
+    @sessions.delete(oldest_session) if @sessions[oldest_session].empty?
+  end
+end
+
+# ---------------------------------------------------------------------------
+# FormationWorker — background memory extraction from cached conversations
+# ---------------------------------------------------------------------------
+# Periodically drains the conversation cache and spawns trick as a separate
+# process to extract memories and write them to crib. Follows the DedupTracker
+# background thread pattern.
+
+class FormationWorker
+  def initialize(cache)
+    @cache = cache
+    start_worker
+  end
+
+  def self.formation_enabled?
+    !File.exist?(FORMATION_DISABLED_FLAG)
+  end
+
+  private
+
+  def start_worker
+    Thread.new do
+      loop do
+        sleep FORMATION_INTERVAL
+        run_formation
+      rescue => e
+        $stderr.puts "escort: formation error: #{e.class}: #{e.message}"
+      end
+    end
+  end
+
+  def run_formation
+    return unless self.class.formation_enabled?
+    return unless File.executable?(TRICK_BIN)
+
+    all_sessions = @cache.drain_all
+    return if all_sessions.empty?
+
+    all_sessions.each do |session_id, entries|
+      next if entries.empty?
+
+      # Build JSONL from cached entries
+      jsonl = entries.map { |e|
+        JSON.generate({
+          type: 'user',
+          uuid: "formation-#{session_id}-#{e[:timestamp].to_i}",
+          timestamp: e[:timestamp].utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+          sessionId: session_id,
+          message: { content: e[:query] }
+        })
+      }.join("\n")
+
+      # Spawn trick as a separate process with timeout
+      begin
+        env = {}
+        env['CRIB_DB'] = ENV['CRIB_DB'] if ENV['CRIB_DB']
+        env['TRICK_SESSION_ID'] = "escort-#{session_id}"
+
+        in_r, in_w = IO.pipe
+        pid = Process.spawn(env, TRICK_BIN, in: in_r, out: File::NULL, err: File::NULL)
+        in_r.close
+        in_w.write(jsonl)
+        in_w.close
+
+        # Wait with 60s timeout
+        deadline = Time.now + 60
+        loop do
+          _, status = Process.waitpid2(pid, Process::WNOHANG)
+          break if status
+          if Time.now > deadline
+            Process.kill('TERM', pid) rescue nil
+            Process.waitpid2(pid) rescue nil
+            $stderr.puts "escort: formation timed out for session #{session_id}"
+            break
+          end
+          sleep 0.5
+        end
+
+        $stderr.puts "escort: formation completed for session #{session_id} (#{entries.length} entries)"
+      rescue => e
+        $stderr.puts "escort: formation spawn error: #{e.class}: #{e.message}"
+      end
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
 # MemoryRetriever — wraps `crib retrieve` via Process.spawn
 # ---------------------------------------------------------------------------
 # Passes query text on stdin. Returns a hash with :text (the raw crib output)
@@ -116,6 +294,8 @@ class MemoryRetriever
 
     env = {}
     env['CRIB_DB'] = ENV['CRIB_DB'] if ENV['CRIB_DB']
+
+    $stderr.puts "escort: crib cmd=#{CRIB} CRIB_DB=#{env['CRIB_DB'] || '(default)'} query_len=#{query.length}"
 
     in_r, in_w = IO.pipe
     out_r, out_w = IO.pipe
@@ -155,18 +335,24 @@ class MemoryRetriever
     err_str = err_r.read
     err_r.close
 
+    $stderr.puts "escort: crib exit=#{status.exitstatus} stdout=#{stdout&.bytesize || 0}B stderr=#{err_str&.bytesize || 0}B elapsed=#{elapsed}ms"
+    $stderr.puts "escort: crib stderr: #{err_str}" unless err_str.nil? || err_str.empty?
+
     unless status.success?
-      $stderr.puts "escort: crib retrieve failed (#{elapsed}ms): #{err_str}" unless err_str.empty?
+      $stderr.puts "escort: crib retrieve failed (exit #{status.exitstatus})"
       return nil
     end
 
-    return nil if stdout.nil? || stdout.strip.empty?
+    if stdout.nil? || stdout.strip.empty?
+      $stderr.puts "escort: crib returned empty stdout"
+      return nil
+    end
 
     text = stdout.strip
     $stderr.puts "escort: crib retrieve completed (#{elapsed}ms, #{text.bytesize} bytes)"
     { text: text, hash: Digest::SHA256.hexdigest(text) }
   rescue => e
-    $stderr.puts "escort: crib retrieve error: #{e.message}"
+    $stderr.puts "escort: crib retrieve error: #{e.class}: #{e.message}"
     nil
   end
 end
@@ -204,37 +390,41 @@ module RequestModifier
     last_user = messages.reverse_each.find { |m| m['role'] == 'user' }
     if last_user
       human_text = extract_plain_text(last_user['content'])
-      return human_text[-500..] unless human_text.empty?
+      return human_text unless human_text.empty?
     end
 
     # Agentic step: use the agent's reasoning from the last assistant message.
     last_assistant = messages.reverse_each.find { |m| m['role'] == 'assistant' }
     if last_assistant
       reasoning = extract_assistant_text(last_assistant['content'])
-      return reasoning[-500..] unless reasoning.empty?
+      return reasoning unless reasoning.empty?
     end
 
     nil
   end
 
-  # Extract text blocks from user message content, filtering out blocks
-  # that are entirely wrapped in a single XML element (system injections).
+  # Find the human's text in a user message.
+  #
+  # Claude Code prepends system content (hooks, compaction summaries, command
+  # output) and appends the human's input last. So: take the last text block
+  # that isn't XML-wrapped. Not all of them — just the last one.
   def extract_plain_text(content)
-    texts = case content
-            when String
-              s = content.strip
-              system_injected?(s) ? [] : [s]
-            when Array
-              content.filter_map { |block|
-                next unless block.is_a?(Hash) && block['type'] == 'text'
-                t = block['text'].to_s.strip
-                next if t.empty? || system_injected?(t)
-                t
-              }
-            else
-              []
-            end
-    texts.join("\n").strip
+    case content
+    when String
+      s = content.strip
+      system_injected?(s) ? '' : s
+    when Array
+      # Walk backward to find the last human text block
+      content.reverse_each do |block|
+        next unless block.is_a?(Hash) && block['type'] == 'text'
+        t = block['text'].to_s.strip
+        next if t.empty? || system_injected?(t)
+        return t
+      end
+      ''
+    else
+      ''
+    end
   end
 
   # Extract text blocks from assistant message content. These are the agent's
@@ -373,6 +563,8 @@ class EscortProxy
   def initialize
     @dedup = DedupTracker.new
     @retriever = MemoryRetriever.new
+    @cache = ConversationCache.new
+    @formation = FormationWorker.new(@cache)
     @active = 0
     @active_mutex = Mutex.new
   end
@@ -409,6 +601,79 @@ class EscortProxy
   def log_request(**fields)
     parts = fields.compact.map { |k, v| "#{k}=#{v}" }
     $stderr.puts "escort: #{parts.join(' ')}"
+  end
+
+  def dump_last_user_message(messages)
+    last_user = messages.reverse_each.find { |m| m['role'] == 'user' }
+    return unless last_user
+
+    content = last_user['content']
+    $stderr.puts "escort: === LAST USER MESSAGE DUMP ==="
+    case content
+    when String
+      $stderr.puts "escort: [string] #{content.bytesize} bytes"
+      $stderr.puts content
+    when Array
+      $stderr.puts "escort: #{content.size} content blocks"
+      content.each_with_index do |block, i|
+        if block.is_a?(Hash)
+          type = block['type'] || 'unknown'
+          case type
+          when 'text'
+            text = block['text'].to_s
+            $stderr.puts "escort: --- block #{i} type=text #{text.bytesize} bytes ---"
+            $stderr.puts text
+          when 'tool_result'
+            tool_id = block['tool_use_id']
+            inner = block['content']
+            inner_size = inner.is_a?(String) ? inner.bytesize : inner.to_s.bytesize
+            $stderr.puts "escort: --- block #{i} type=tool_result tool_use_id=#{tool_id} #{inner_size} bytes ---"
+            $stderr.puts inner.is_a?(String) ? inner : JSON.pretty_generate(inner)
+          else
+            $stderr.puts "escort: --- block #{i} type=#{type} ---"
+            $stderr.puts JSON.pretty_generate(block)
+          end
+        else
+          $stderr.puts "escort: --- block #{i} (not a hash) ---"
+          $stderr.puts block.inspect
+        end
+      end
+    end
+    $stderr.puts "escort: === END DUMP ==="
+  end
+
+  def dump_last_assistant_message(messages)
+    last_asst = messages.reverse_each.find { |m| m['role'] == 'assistant' }
+    unless last_asst
+      $stderr.puts "escort: === NO ASSISTANT MESSAGE ==="
+      return
+    end
+
+    content = last_asst['content']
+    $stderr.puts "escort: === LAST ASSISTANT MESSAGE DUMP ==="
+    case content
+    when String
+      $stderr.puts "escort: [string] #{content.bytesize} bytes"
+      $stderr.puts content
+    when Array
+      $stderr.puts "escort: #{content.size} content blocks"
+      content.each_with_index do |block, i|
+        if block.is_a?(Hash)
+          type = block['type'] || 'unknown'
+          case type
+          when 'text'
+            text = block['text'].to_s
+            $stderr.puts "escort: --- block #{i} type=text #{text.bytesize} bytes ---"
+            $stderr.puts text
+          when 'tool_use'
+            $stderr.puts "escort: --- block #{i} type=tool_use name=#{block['name']} ---"
+          else
+            $stderr.puts "escort: --- block #{i} type=#{type} ---"
+          end
+        end
+      end
+    end
+    $stderr.puts "escort: === END ASSISTANT DUMP ==="
   end
 
   def start_file_watcher(server)
@@ -483,6 +748,11 @@ class EscortProxy
 
     messages = body['messages']
     session_id = extract_session_id(body)
+
+    # Dump message structure for debugging.
+    dump_last_user_message(messages)
+    dump_last_assistant_message(messages)
+
     query = RequestModifier.extract_query(body)
 
     # Shortcut: no query or no session → passthrough
@@ -494,6 +764,9 @@ class EscortProxy
     end
 
     $stderr.puts "escort: query_text: #{query}"
+
+    # Cache for background formation
+    @cache.append(session_id, query)
 
     started_at = Time.now
     result = @retriever.retrieve(query)
@@ -535,7 +808,8 @@ class EscortProxy
       port: PORT,
       upstream: UPSTREAM.to_s,
       crib: CRIB,
-      crib_available: crib_ok
+      crib_available: crib_ok,
+      formation_enabled: FormationWorker.formation_enabled?
     })
     client.write("HTTP/1.1 200 OK\r\n")
     client.write("Content-Type: application/json\r\n")
