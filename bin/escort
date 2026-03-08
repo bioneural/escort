@@ -773,7 +773,8 @@ class EscortProxy
     crib_ms = ((Time.now - started_at) * 1000).round
 
     if result && !@dedup.seen?(session_id, result[:hash])
-      body = RequestModifier.inject_memory(body, result[:text])
+      knowledge_hint = "\n\nA browsable knowledge directory is available at .state/crib/knowledge/ — read _index.md for a dashboard of all memories, staleness warnings, and coverage gaps."
+      body = RequestModifier.inject_memory(body, result[:text] + knowledge_hint)
       @dedup.record(session_id, result[:hash])
       modified_raw = JSON.generate(body)
       log_request(messages: messages.size, model: body['model'], query: query.length,
